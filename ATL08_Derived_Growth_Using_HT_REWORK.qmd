@@ -1,0 +1,512 @@
+---
+title: "ATL08_Derived_Growth_Using_HT"
+format: html
+editor: visual
+---
+
+## Libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(RobustLinearReg)
+library(arrow)
+library(dplyr)
+library(glue)
+library(mase)
+library(patchwork)
+```
+
+## Global Variables
+
+```{r}
+# Number of iterations for bootstrapping (only used for Theil-Sen regression)
+numberOfIterations <- 10000
+
+# Levels of our factors
+nlcd_types <- c("Deciduous Forest", "Evergreen Forest", "Mixed Forest", "Woody Wetlands")
+disturbance_presence_types <- c("Yes", "No")
+fast_loss_groups <- c("<10 Years", "10-20 Years", "20-30 Years", "30+ Years")
+
+# Custom plotting colors for each factor level
+custom_colors <- c(
+  # forest cover 
+  "Deciduous Forest" = "#a1d99b",
+  "Evergreen Forest" = "#74c476",
+  "Mixed Forest" = "#31a354",
+  "Woody Wetlands" = "#006d2c",
+  
+  # disturbance binary (reds)
+  "Yes" = "#fb6a4a",
+  "No" = "#cb181d",
+  
+  # years since
+  "<10 Years" = "#9ecae1",
+  "10-20 Years" = "#6baed6",
+  "20-30 Years" = "#3182bd",
+  "30+ Years" = "#08519c"
+)
+
+customTheme <-theme(
+      plot.title = element_text(size = 22, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = 20),
+      axis.line = element_line(linewidth = 0.5, color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.text = element_text(size=15),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      coord_cartesian(clip = "off")
+    )
+```
+
+## Reading Data
+
+Our working set is ICESat-2 ATL08 segments with:
+
+-   \> 3 years recovery
+
+-   disturbance before the year of collection
+
+Further, we remove segments collected in 2019 which demonstrated spatial differences in forest height from equivalence testing
+
+```{r}
+workingSet <- read_parquet(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\segments\workingSetPolygonsWITHALSMetrics.parquet)") |> 
+  filter(!(year == 2019))
+```
+
+## Net Growth
+
+### Un-stratified Horvitz-Thompson results
+
+```{r}
+y20 <- workingSet |> filter(year == 2020) |> pull(h_canopy)
+ht20 <- horvitzThompson(y = y20,
+                        N = length(y20), 
+                        var_est = TRUE,
+                        var_method = "LinHH")
+
+y24 <- workingSet |> filter(year == 2024) |> pull(h_canopy)
+ht24 <- horvitzThompson(y = y24,
+                        N = length(y24),
+                        var_est = TRUE,
+                        var_method = "LinHH")
+
+
+unstratified_atl08_ht <- data.frame(
+     first_year_length = length(y20),
+     first_year_pop_mean = ht20$pop_mean,
+     first_year_var = ht20$pop_mean_var,
+     last_year_length = length(y24),
+     last_year_pop_mean = ht24$pop_mean,
+     last_year_var = ht24$pop_mean_var,
+     net_growth = ht24$pop_mean - ht20$pop_mean
+  )
+unstratified_atl08_ht
+```
+### Confidence interval
+```{r}
+atl08_t1_var <- var(y20)
+atl08_t2_var <- var(y24)
+# atl08_t1_var <- unstratified_atl08_ht$first_year_var
+# atl08_t2_var <- unstratified_atl08_ht$last_year_var
+atl08_pooled_var <- atl08_t1_var + atl08_t2_var
+atl08_nft <- 1.96 * sqrt(atl08_pooled_var) 
+atl08_nft
+```
+
+#### Graphing
+```{r}
+atl08_start_heights_plot <- ggplot(mapping = aes(y20)) + 
+  geom_histogram(binwidth = 1, fill = "#3689D2", color = "black") +
+  scale_x_continuous(breaks = seq(0, 40, by = 5)) +
+  geom_vline(xintercept=mean(y20), color='red', lwd=.75)+
+  annotate("text", x = 14, y = 275, size=7, face='bold', color='black', label = glue("Mean: {round(mean(y20), 2)}"))+
+  labs(title = "Start ATL08 Heights",
+       x = "Height (m)",
+       y = "Frequency")+
+  theme_minimal() +
+  customTheme
+
+atl08_start_heights_plot
+
+atl08_end_heights_plot <- ggplot(mapping = aes(y24)) + 
+  geom_histogram(binwidth = 1, fill = "#8A7D63", color = "black") +
+  scale_x_continuous(breaks = seq(0, 40, by = 5)) + 
+  geom_vline(xintercept=mean(y24), color='red', lwd=.75)+
+  annotate("text", x = 15, y = 775, size=7, face='bold', color='black', label = glue("Mean: {round(mean(y24), 2)}"))+
+  labs(title = "End ATL08 Heights",
+       x = "Height (m)",
+       y = "Frequency")+
+  theme_minimal() +
+  customTheme 
+
+atl08_end_heights_plot
+
+combined_atl08_heights_plot <- (atl08_start_heights_plot + atl08_end_heights_plot)
+
+ggsave(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\figures\combined_atl08_heights_plot.png)", plot = combined_atl08_heights_plot, bg = "transparent",
+width = 16, height = 8, units = "in", dpi = 300)
+
+combined_atl08_heights_plot
+```
+
+### Horvitz-Thompson estimator function
+
+```{r}
+HTByFactor <- function(dataframe, factorName, factorLevel, heightsColumn, firstYear, lastYear){
+  
+  print(glue("Running HT estimators for {factorName} {factorLevel}, for years {firstYear} and {lastYear}"))
+  
+  # Pulling heights from our first year of data
+  first_year_heights <- dataframe |> 
+    filter(year == firstYear) |> 
+    filter(.data[[factorName]] == factorLevel) |> 
+    pull(.data[[heightsColumn]])
+  
+  # getting the length (N) of the first year's population
+  first_year_length <- length(first_year_heights)
+  
+  # running HT estimator on the first year's population
+  first_year_ht <- horvitzThompson(y = first_year_heights, 
+                          N = first_year_length,
+                          var_est = FALSE)
+  
+  # calculating variance of first year's canopy heights
+  first_year_var <- var(first_year_heights)
+  
+  
+  # Pulling heights from our last year of data
+  last_year_heights <- dataframe |> 
+    filter(year == lastYear) |> 
+    filter(.data[[factorName]] == factorLevel) |> 
+    pull(.data[[heightsColumn]])
+  
+  # getting the length (N) of the last year's population
+  last_year_length <- length(last_year_heights)
+  
+  # running HT estimator on the last year's population
+  last_year_ht <- horvitzThompson(y = last_year_heights,
+                                  N = last_year_length, 
+                                  var_est = FALSE)
+  
+  # calculating variance of last year's canopy heights
+  last_year_var <- var(last_year_heights)
+  
+  # difference in first year and last year canopy height as proxy for net growth
+  diff_means <-  last_year_ht$pop_mean - first_year_ht$pop_mean 
+  
+  # confidence interval of the difference in means
+  diff_ci <- 1.96 * sqrt(first_year_var + last_year_var)
+
+  # combining results into a dataframe
+   factor_ht_results <- data.frame(
+     factor = factorName,
+     level = factorLevel,
+     first_year_n = first_year_length,
+     last_year_n = last_year_length,
+     first_year_pop_mean = first_year_ht$pop_mean, # mean canopy height at the start of the segment timeframe
+     last_year_pop_mean = last_year_ht$pop_mean, # mean canopy height at the end of the segment timeframe
+     diff_in_means = diff_means, 
+     CI_of_diff = diff_ci
+   )
+
+  cat("\n")
+
+  return(factor_ht_results)
+}
+
+# wrapper function to run a HT estimator for each level of the supplied factor
+run_HT_for_factor <- function(levels, fac, dataframe, heightsColumn, firstYear, lastYear) {
+  results <- lapply(levels, function(lvl) {
+    res <- HTByFactor(
+      dataframe = dataframe,
+      factorName = fac,
+      factorLevel = lvl,
+      heightsColumn = heightsColumn,
+      firstYear = firstYear,
+      lastYear = lastYear
+    )
+    return(res)
+  }) |> bind_rows()
+  return(results)
+}
+```
+
+### Stratified Horvitz-Thompson estimator results
+
+```{r}
+nlcd_ht_results <- run_HT_for_factor(nlcd_types, "NLCD_2023_Label", workingSet, "h_canopy", 2020, 2024)
+
+disturbance_ht_results <- run_HT_for_factor(disturbance_presence_types, "DisturbancePresence", workingSet, "h_canopy", 2020, 2024)
+
+fast_loss_ht_results <- run_HT_for_factor(fast_loss_groups, "FastLossAgeGroup", workingSet, "h_canopy", 2020, 2024)
+
+# putting them all together
+final_ht_results <- bind_rows(nlcd_ht_results, disturbance_ht_results, fast_loss_ht_results) %>%
+  mutate(
+    factor = recode(factor,
+      "NLCD_2023_Label"   = "Forest Cover Type",
+      "DisturbancePresence" = "Disturbance Presence",
+      "FastLossAgeGroup" = "Years Since Disturbance"
+    )
+  )
+
+write.csv(final_ht_results, r"(C:\Users\poncy\Desktop\Masters\Research\Publication\R\final_ht_results.csv)")
+
+final_ht_results
+```
+
+### Graphing
+
+```{r}
+nlcd_ht_plot <- final_ht_results |> 
+  filter(factorName == "Forest Cover Type") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = diff_in_means, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # labeling bars
+    geom_text(
+      aes(label = round(diff_in_means, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Forest Cover Type",
+      y = "Net Growth (m)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme
+
+disturbance_ht_plot <- final_ht_results |> 
+  filter(factorName == "Disturbance Presence") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = diff_in_means, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+     # labeling bars
+    geom_text(
+      aes(label = round(diff_in_means, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Disturbance Presence",
+      y = "Net Growth (m)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme +
+  theme(axis.text.y = element_blank(),axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank()) # removing y-axis and labels
+
+years_since_ht_plot <- final_ht_results |> 
+  filter(factorName == "Years Since Disturbance") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = diff_in_means, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # labeling bars
+    geom_text(
+      aes(label = round(diff_in_means, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Years Since Disturbance",
+      y = "Net Growth (m)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme +
+  theme(axis.text.y = element_blank(),axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank()) # removing y-axis and labels
+
+combined_ht_plot <- (nlcd_ht_plot + disturbance_ht_plot + years_since_ht_plot ) & scale_y_continuous(limits = c(0,3.5))
+
+ggsave(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\figures\combined_ht_plot.png)", plot = combined_ht_plot, bg = "transparent",
+width = 16, height = 8, units = "in", dpi = 300)
+
+combined_ht_plot
+```
+
+## Incremental Growth
+
+### Graphing
+
+#### Slope plot
+
+```{r}
+final_tsr_results <- read_csv(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\R\final_tsr_results.csv)")
+
+nlcd_slope_plot <- final_tsr_results |> 
+  filter(factorName == "Forest Cover Type") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = median_slope, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # only labeling significant bars
+    geom_text(
+      data = \(d) d |> filter(median_p_value < 0.05),
+      aes(label = round(median_slope, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Forest Cover Type",
+      y = "Slope (meters per year)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme 
+
+disturbance_slope_plot <- final_tsr_results |> 
+  filter(factorName == "Disturbance Presence") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = median_slope, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # only labeling significant bars
+    geom_text(
+      data = \(d) d |> filter(median_p_value < 0.05),
+      aes(label = round(median_slope, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Disturbance Presence",
+      y = "Slope (meters per year))",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme + 
+    theme(axis.text.y = element_blank(),axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+
+years_since_slope_plot <- final_tsr_results |> 
+  filter(factorName == "Years Since Disturbance") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = median_slope, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # only labeling significant bars
+    geom_text(
+      data = \(d) d |> filter(median_p_value < 0.05),
+      aes(label = round(median_slope, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Years Since Disturbance",
+      y = "Slope (meters per year)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme + 
+    theme(axis.text.y = element_blank(),axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+
+
+# Combine with patchwork and add a single overarching title
+combined_slope_plot <- (nlcd_slope_plot + disturbance_slope_plot + years_since_slope_plot ) & scale_y_continuous(limits = c(0, 0.65))
+
+
+ggsave(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\figures\TSR_Slope_Plot.png)", plot = combined_slope_plot, bg = "transparent",
+width = 16, height = 8, units = "in", dpi = 300)
+
+combined_slope_plot
+
+```
+
+#### Intercept plot
+
+```{r}
+nlcd_intercept_plot <- final_tsr_results |> 
+  filter(factorName == "Forest Cover Type") |> 
+  ggplot(aes(x = level, y = median_intercept, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # only labeling significant bars
+    geom_text(
+      data = \(d) d |> filter(median_p_value < 0.05),
+      aes(label = round(median_intercept, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Forest Cover Type",
+      y = "Baseline (meters)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme 
+
+disturbance_intercept_plot <- final_tsr_results |> 
+  filter(factorName == "Disturbance Presence") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = median_intercept, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # only labeling significant bars
+    geom_text(
+      data = \(d) d |> filter(median_p_value < 0.05),
+      aes(label = round(median_intercept, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Disturbance Presence",
+      y = "Baseline (meters)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme + 
+    theme(axis.text.y = element_blank(),axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+
+years_since_intercept_plot <- final_tsr_results |> 
+  filter(factorName == "Years Since Disturbance") |> 
+  # mutate(level = factor(level, levels = levels_order)) |> 
+  ggplot(aes(x = level, y = median_intercept, fill = level)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = custom_colors) +
+    # only labeling significant bars
+    geom_text(
+      data = \(d) d |> filter(median_p_value < 0.05),
+      aes(label = round(median_intercept, 2)),
+      vjust = -0.5,
+      size = 6,
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    labs(
+      x = "Years Since Disturbance",
+      y = "Baseline (meters)",
+      title = element_blank()
+    ) +
+    theme_minimal() +
+    customTheme + 
+    theme(axis.text.y = element_blank(),axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+
+
+# Combine with patchwork and add a single overarching title
+combined_intercept_plot <- (nlcd_intercept_plot + disturbance_intercept_plot + years_since_intercept_plot) & scale_y_continuous(limits = c(0, 25))
+
+
+ggsave(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\figures\TSR_Intercept_Plot.png)", plot = combined_intercept_plot, bg = "transparent",
+width = 16, height = 8, units = "in", dpi = 300)
+
+combined_intercept_plot
+```

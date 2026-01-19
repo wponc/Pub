@@ -1,0 +1,328 @@
+---
+title: "NFI_Reference_Growth"
+format: html
+editor: visual
+---
+
+## Importing packages & setting path to local copy of North Carolina FIADB
+
+```{r setup, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(mase)
+library(dplyr)
+library(RobustLinearReg)
+library(ggplot2)
+library(glue)
+library(patchwork)
+data_path = file.path(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\FIAData\FIADB_Direct\Working)")
+source(file.path(file.path(data_path,'FIADB_Direct_source_all.R')))
+```
+
+## Global Variables
+
+```{r}
+# The number of years in out ATL08 timeframe (4 years)
+timeframeLength <- 4
+
+customTheme <-theme(
+      plot.title = element_text(size = 22, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = 20),
+      axis.line = element_line(linewidth = 0.5, color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.text = element_text(size=15),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      coord_cartesian(clip = "off")
+    )
+
+# Global minima of 2 meters
+globalMinima <- 2
+
+# Global maxima of 39.423 meters
+globalMaxima <- 39.423476440429695
+```
+
+## Extracting NFI plot data from FIADB
+
+```{r}
+NC_plots_AGB <- PLOT_obs(EVAL_GRP = 372023, ATTRIBUTE_NBR = 10,GRP_BY_ATTRIB = c('unitcd','countycd')) |> 
+  filter(COUNTYCD %in% c(13, 15, 17, 19, 29, 31, 41, 47, 49, 53, 55, 61, 65, 69, 73, 79, 83, 91, 95,101, 103, 107, 117, 127, 129, 131, 133, 137, 139, 141, 143, 147, 155, 163, 177, 181, 185, 187, 191, 195)
+  ) # here i'm generating plot-level estimates from all the plots in evaluation group 372023, corresponding to North Carolina plots visited in 2023. Then, filtering to just those within the counties of the study area using the county code
+
+# unique plot codes for EVAL_GRP 372023 within study area
+PLT_CN <- unique(NC_plots_AGB$PLT_CN)
+
+# this grabs plots from the PLOT table with sequence numbers matching our NC_plots_AGB 
+plot <- GET_record(TABLE_NAME = 'plot',VAR_NAME = 'cn',VAR_VALUES = PLT_CN) |> 
+  rename(PLT_CN = CN)
+
+# this grabs conditions from the CONDITION table with sequnce numbers matching our NC_plots_AGB 
+cond <- GET_record(TABLE_NAME = 'cond',VAR_NAME = 'plt_cn',VAR_VALUES = PLT_CN)
+
+# unique plot conditions, as there are multiple plot sequences in cond table
+PLT_CN_ALL <- unique(cond$PLT_CN)
+
+# this only gets plots which match the unique sequence numbers
+plot <- plot |> filter(PLT_CN %in% PLT_CN_ALL)
+
+# getting individual tree records
+tree <- GET_record(TABLE_NAME = 'tree',VAR_NAME = 'plt_cn',VAR_VALUES = PLT_CN_ALL) |> 
+  rename(TRE_CN = CN)
+
+
+### Removing dates
+plot <- plot[,-grep("_DATE",names(plot))]
+cond <- cond[,-grep("_DATE",names(cond))]
+tree <- tree[,-grep("_DATE",names(tree))]
+
+
+### Joining plot, cond, tree tables
+plot_cond <- left_join(plot,cond)
+plot_cond_tree <- left_join(plot_cond,tree)
+# test <- anti_join(tree,plot_cond_tree) # Trees from plots with partial non-SYP fortypecd  
+
+```
+
+## Current NFI plot measurements
+
+```{r}
+### Creating current_tree dataframe for current measurements of individual trees
+current_tree <- plot_cond_tree |> 
+  dplyr::select(PLT_CN,PREV_PLT_CN,STATECD,UNITCD,COUNTYCD,MEASYEAR,REMPER,CONDID,COND_STATUS_CD,FORTYPCD,STDORGCD,
+                STDORGSP,DSTRBCD1,DSTRBYR1, TRTCD1,TRE_CN,PREV_TRE_CN,SUBP,TREE,STATUSCD,SPCD,DIA,HT,ACTUALHT,CCLCD,
+                DAMLOC1,DAMTYP1,DAMSEV1) |> 
+  rename(PLT_CN2 = PLT_CN,
+         MEASYEAR2 = MEASYEAR,
+         CONDID2 = CONDID,
+         COND_STATUS_CD2 = COND_STATUS_CD,
+         FORTYPCD2 = FORTYPCD,
+         STDORGCD2 = STDORGCD,
+         STDORGSP2 = STDORGSP,
+         DSTRBCD12 = DSTRBCD1,
+         DSTRBYR12 = DSTRBYR1,
+         TRTCD12 = TRTCD1,
+         TRE_CN2 = TRE_CN,
+         STATUSCD2 = STATUSCD,
+         DIA2 = DIA, HT2 = HT,
+         ACTUALHT2 = ACTUALHT,
+         CCLCD2 = CCLCD,
+         DAMLOC12 = DAMLOC1,
+         DAMTYP12 = DAMTYP1,
+         DAMSEV12 = DAMSEV1)
+```
+
+## Previous NFI Plot Measurements
+
+```{r}
+# grabs the previous sequence numbers for each plot
+PREV_PLT_CN <- unique(plot$PREV_PLT_CN) 
+
+# then gets the plot records for those previous plot sequence numbers
+prev_plot <- GET_record('plot','cn',PREV_PLT_CN) |> 
+  rename(PLT_CN = CN)
+
+# then grabs the conditions for the previous plot records
+prev_cond <- GET_record(TABLE_NAME = 'cond',VAR_NAME = 'plt_cn',VAR_VALUES = PREV_PLT_CN) |> 
+  filter(FORTYPCD %in% c(141, 142, 161, 162, 166, 171, 402, 403, 404, 406, 407, 409, 501, 503, 504, 505, 506, 507, 508, 511, 512, 514, 515, 516, 517, 519, 520, 962, 995, 601, 602, 605, 606, 607, 608, 609, 701, 702, 703, 704, 705, 706, 708, 709))
+
+# finally, joining tree data for previous plot records
+prev_tree <- GET_record(TABLE_NAME = 'tree',VAR_NAME = 'plt_cn',VAR_VALUES = PREV_PLT_CN) |> 
+  rename(TRE_CN = CN)
+
+# drop _DATE variables from previous plot records
+prev_plot <- prev_plot[,-grep("_DATE",names(prev_plot))]
+prev_cond <- prev_cond[,-grep("_DATE",names(prev_cond))]
+prev_tree <- prev_tree[,-grep("_DATE",names(prev_tree))]
+
+
+### Joining previous plot, cond, tree
+
+# joinging condiiton and tree data from previous plot records
+prev_plot_cond <- left_join(prev_plot,prev_cond)
+prev_plot_cond_tree <- left_join(prev_plot_cond,prev_tree)
+
+# establishing a dataframe of previous tree measurments
+previous_tree <- prev_plot_cond_tree |> 
+  dplyr::select(PLT_CN,STATECD,UNITCD,COUNTYCD,MEASYEAR,CONDID,COND_STATUS_CD,FORTYPCD,STDORGCD,
+                STDORGSP,DSTRBCD1,DSTRBYR1, TRTCD1,TRE_CN,SUBP,TREE,STATUSCD,SPCD,DIA,HT,ACTUALHT,CCLCD,
+                DAMLOC1,DAMTYP1,DAMSEV1)
+```
+
+## Joining current and previous NFI plot measurements
+
+```{r}
+nfi_ht_df <- left_join(current_tree,previous_tree,
+                  by=join_by(STATECD,UNITCD,COUNTYCD,SUBP,TREE,SPCD,
+                             PREV_PLT_CN == PLT_CN,PREV_TRE_CN == TRE_CN)) |> 
+  # Getting measurements in meters
+  mutate(
+    HT_m = HT * .3048,
+    HT2_m = HT2 * .3048,
+    ACTUALHT_m = ACTUALHT * .3048,
+    ACTUALHT2_m = ACTUALHT2 * .3048
+  ) |> 
+  filter(STATUSCD <= 1 & STATUSCD2 <= 1) # STATUS CODE to keep alive trees
+
+# -------------- Mapping forest type ----------------
+
+fortypMapping <- c(
+  # Evergreens
+  "141" = "Evergreen Forest", "142" = "Evergreen Forest", "161" = "Evergreen Forest",
+  "162" = "Evergreen Forest", "166" = "Evergreen Forest", "171" = "Evergreen Forest",
+  "606" = "Evergreen Forest",
+  # then deciduous
+  "501" = "Deciduous Forest", "503" = "Deciduous Forest", "504" = "Deciduous Forest",
+  "505" = "Deciduous Forest", "506" = "Deciduous Forest", "507" = "Deciduous Forest",
+  "508" = "Deciduous Forest", "511" = "Deciduous Forest", "512" = "Deciduous Forest",
+  "514" = "Deciduous Forest", "515" = "Deciduous Forest", "516" = "Deciduous Forest",
+  "517" = "Deciduous Forest", "519" = "Deciduous Forest", "520" = "Deciduous Forest",
+  "701" = "Deciduous Forest", "702" = "Deciduous Forest", "703" = "Deciduous Forest",
+  "704" = "Deciduous Forest", "705" = "Deciduous Forest", "706" = "Deciduous Forest",
+  "708" = "Deciduous Forest", "709" = "Deciduous Forest", "962" = "Deciduous Forest",
+  # then mixed
+  "402" = "Mixed Forest", "403" = "Mixed Forest", "404" = "Mixed Forest", "406" = "Mixed Forest",
+  "407" = "Mixed Forest", "409" = "Mixed Forest",
+  # then woody wetlands
+  "601" = "Woody Wetlands", "602" = "Woody Wetlands", "605" = "Woody Wetlands",
+  "607" = "Woody Wetlands", "608" = "Woody Wetlands", "609" = "Woody Wetlands",
+  # i'll leave unknown just as-is
+  "999" = "Unknown"
+)
+
+# then applying the mapping
+nfi_ht_df <- nfi_ht_df |>
+  mutate(NLCD_2023_Label = recode(as.character(FORTYPCD), !!!fortypMapping)
+         )
+
+# -------------- Mapping disturbance presence ----------------
+
+# encoding disturbance presence
+nfi_ht_df$DisturbancePresence <- ifelse(nfi_ht_df$DSTRBCD12 == 0, 'No', 'Yes')
+
+# adding years since disturbance
+nfi_ht_df$YearsSinceDisturbance <- nfi_ht_df$MEASYEAR2 - nfi_ht_df$DSTRBYR12 
+
+# here marking continuous disturbances (9999 for disturbance year) and were negative in prev calculation
+nfi_ht_df$YearsSinceDisturbance <- ifelse(nfi_ht_df$YearsSinceDisturbance < 0, 'Continuous', nfi_ht_df$YearsSinceDisturbance)
+```
+
+## Filtering NFI observations
+
+```{r}
+nfi_df_filtered <- nfi_ht_df |> 
+  filter(HT2_m >= HT_m) |> # removing negative changes in total height 
+  filter(ACTUALHT2_m >= ACTUALHT_m) |> # removing negative changes in actual height
+  
+  filter(HT_m >= globalMinima & HT_m <= globalMaxima) |> # filtering previous total heights to within our min and max values
+  filter(HT2_m >= globalMinima & HT2_m <= globalMaxima) |>  # filtering current total heights to within our min and max values
+  
+  filter(ACTUALHT_m >= globalMinima & ACTUALHT_m <= globalMaxima) |>  # filtering previous actual heights to within our min and max values
+  filter(ACTUALHT2_m >= globalMinima & ACTUALHT2_m <= globalMaxima) |>  # filtering current actual heights to within our min and max values
+  
+  filter(REMPER >= (timeframeLength - 0.1) & REMPER <= (timeframeLength + 1.1)) # LIMITING REMEASUREMENT PERIOD TO MATCH ATL08 TIMEFRAME
+```
+
+## Calculating plot-level net change in tree height and tree height increment
+
+Here we aggregate individual-tree observations up to the plot level mean.
+
+```{r}
+# Mean plot-level tree height at time 1
+mean_height_t1 <- nfi_df_filtered |> 
+  group_by(PLT_CN2) |> # grouping by plot sequence numbers at revisit
+  summarise("Time 1" = mean(ACTUALHT_m, na.rm = TRUE)) # plot-level mean actual tree height at t1
+
+# Mean plot-level tree height at time 2
+mean_height_t2 <- nfi_df_filtered |> 
+  group_by(PLT_CN2) |> # grouping by plot sequence numbers at revisit
+  summarise("Time 2" = mean(ACTUALHT2_m, na.rm = TRUE)) # plot-level mean actual tree height at t2
+
+# merging net change and increment into a single Df
+ht_plot_level_heights <- merge(mean_height_t1, mean_height_t2, by="PLT_CN2")
+
+```
+
+## Estimating net change in tree height using the Horvitz-Thompson estimator
+
+```{r}
+# Number of remeasurement plots after all filters
+fia_n <- nrow(ht_plot_level_heights)
+
+# Estimating mean tree height at t1
+t1_ht <- horvitzThompson(y = ht_plot_level_heights$`Time 1`, 
+                         N = fia_n,
+                         var_est = TRUE,
+                         var_method = "LinHH")
+
+
+# Estimating mean tree height at t2
+t2_ht <- horvitzThompson(y = ht_plot_level_heights$`Time 2`,
+                         N = fia_n,
+                         var_est = TRUE,
+                         var_method = "LinHH")
+
+# Calculating difference of t2 and t1 means as proxy for net growth 
+nfi_net_growth <- t2_ht$pop_mean - t1_ht$pop_mean
+nfi_net_growth
+
+```
+## Confidence Interval of NFI data
+```{r}
+# nfi_t1_var <- var(ht_plot_level_heights$`Time 1`)
+# nfi_t2_var <- var(ht_plot_level_heights$`Time 2`)
+nfi_t1_var <- t1_ht$pop_mean_var
+nfi_t2_var <- t2_ht$pop_mean_var
+nfi_cov <- cov(ht_plot_level_heights$`Time 1`, ht_plot_level_heights$`Time 2`)
+nfi_pooled_var <- (nfi_t1_var + nfi_t2_var) - nfi_cov
+ci_nft <- 1.96 * sqrt(nfi_pooled_var) 
+ci_nft
+```
+
+## Pivoting
+```{r}
+ht_plot_level_heights_longer <- ht_plot_level_heights |> 
+  pivot_longer(
+    cols = c(`Time 1`, `Time 2`),
+    names_to = "Variable",
+    values_to = "Value"
+  )
+ht_plot_level_heights_longer
+```
+
+## Graphing
+```{r}
+nfi_t1_heights_plot <- ggplot(ht_plot_level_heights, aes(x = `Time 1`)) + 
+  geom_histogram(binwidth = 1, fill = "#3689D2", color = "black") +
+  scale_x_continuous(breaks = seq(0, 30, by = 5)) + 
+  geom_vline(xintercept=mean(ht_plot_level_heights$`Time 1`), color='red', lwd=.75)+
+  annotate("text", x = 12, y = 25, size=7, face='bold', color='black', label = glue("Mean: {round(mean(ht_plot_level_heights$`Time 1`), 2)}"))+
+  labs(title = "Previous",
+       x = "Height (m)",
+       y = "Frequency")+
+  theme_minimal() +
+  customTheme
+
+nfi_t1_heights_plot
+
+nfi_t2_heights_plot <- ggplot(ht_plot_level_heights, aes(x = `Time 2`)) + 
+  geom_histogram(binwidth = 1, fill = "#8A7D63", color = "black") +
+  scale_x_continuous(breaks = seq(0, 30, by = 5)) + 
+  geom_vline(xintercept=mean(ht_plot_level_heights$`Time 2`), color='red', lwd=.75)+
+  annotate("text", x = 13.75, y = 25, size=7, face='bold', color='black', label = glue("Mean: {round(mean(ht_plot_level_heights$`Time 2`), 2)}"))+
+  labs(title = "Current",
+       x = "Height (m)",
+       y = "Frequency")+
+  theme_minimal() +
+  customTheme
+
+nfi_t2_heights_plot
+
+combined_nfi_heights_plot <- (nfi_t1_heights_plot + nfi_t2_heights_plot)
+
+ggsave(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\figures\combined_nfi_heights_plot.png)", plot = combined_nfi_heights_plot, bg = "transparent",
+width = 16, height = 8, units = "in", dpi = 300)
+
+combined_nfi_heights_plot
+```
+
