@@ -1,0 +1,74 @@
+---
+title: "ATL08_Derived_Growth_Using_HT"
+format: html
+editor: visual
+---
+
+## Libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(arrow)
+library(dplyr)
+library(mase)
+```
+
+## Reading Data
+
+Our working set is ICESat-2 ATL08 segments with:
+
+-   \> 3 years recovery
+
+-   disturbance before the year of collection
+
+Further, we remove segments collected in 2019 which demonstrated spatial differences in forest height from equivalence testing
+
+```{r}
+workingSet <- read_parquet(r"(C:\Users\poncy\Desktop\Masters\Research\Publication\segments\workingSetPolygonsWITHALSMetrics.parquet)") |> 
+  filter(!(year == 2019))
+```
+
+## Net Growth
+```{r}
+y20 <- workingSet |> filter(year == 2020) |> pull(h_canopy)
+ht20 <- horvitzThompson(y = y20,
+                        N = length(y20), 
+                        var_est = FALSE)
+
+y24 <- workingSet |> filter(year == 2024) |> pull(h_canopy)
+ht24 <- horvitzThompson(y = y24,
+                        N = length(y24),
+                        var_est = FALSE)
+
+
+# Calculating difference of 2024 and 2020 mean segment heights as proxy for net growth 
+atl08_net_growth <- ht24$pop_mean - ht20$pop_mean
+atl08_net_growth
+```
+
+## Calculating variances
+Doing this by hand, separately for t1 and t2 heights
+```{r}
+# helper function for calculating variance from one of our samples
+sample_variance <- function(sample) {
+  # the sum of the squared difference for each element in the sample, divided it by (n-1)
+  sum((sample - mean(sample))^2) / (length(sample) - 1)
+}
+
+var20 <- sample_variance(y20)
+
+var24 <- sample_variance(y24)
+```
+
+## Pooled variance 
+For ATL08, this is t1 variance plus t2 variance
+```{r}
+atl08_pooled_var <- var20 + var24
+atl08_pooled_var
+```
+
+## Confidence interval
+```{r}
+atl08_confidence_interval <- 1.96 * sqrt(atl08_pooled_var)
+atl08_confidence_interval
+```
